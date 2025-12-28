@@ -1,0 +1,6 @@
+.env
+*.log
+.DS_Store
+tenderenv/
+data/processed/notifications.json
+data/processed/notifications.log

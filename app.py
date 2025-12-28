@@ -1,19 +1,36 @@
 from __future__ import annotations
 
+import atexit
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
+from apscheduler.jobstores.base import JobLookupError
+from apscheduler.schedulers.background import BackgroundScheduler
+
 from ai_utils import get_ai_score_and_summary
 from config import LATEST_CLEAN_PATH
+from mailer import run_scheduled_digest, send_priority_digest
+from notifications import (
+    NotificationSettings,
+    append_notification_log,
+    load_notification_settings,
+    parse_recipient_input,
+    parse_time_string,
+    save_notification_settings,
+    tail_notification_log,
+    validate_addresses,
+)
 from run_pipeline import run_pipeline
 from vectorstore import VectorResult, semantic_search
 
 
 FALLBACK_DATA_PATH = Path("tenders_clean.csv")
+SCHEDULER_JOB_ID = "daily_notification_digest"
 
 
 st.set_page_config(page_title="UAE Tender AI Dashboard", page_icon="🇦🇪", layout="wide")
@@ -31,6 +48,100 @@ def locate_dataset() -> Optional[Path]:
         if candidate_path.exists():
             return candidate_path
     return None
+
+
+def _shutdown_scheduler() -> None:
+    scheduler: BackgroundScheduler | None = st.session_state.get("_notification_scheduler")
+    if scheduler and scheduler.running:
+        scheduler.shutdown(wait=False)
+
+
+def get_scheduler() -> BackgroundScheduler:
+    scheduler: BackgroundScheduler | None = st.session_state.get("_notification_scheduler")
+    if scheduler and scheduler.running:
+        return scheduler
+
+    scheduler = BackgroundScheduler(timezone="UTC")
+    scheduler.start()
+    st.session_state["_notification_scheduler"] = scheduler
+
+    if not st.session_state.get("_scheduler_shutdown_registered"):
+        atexit.register(_shutdown_scheduler)
+        st.session_state["_scheduler_shutdown_registered"] = True
+
+    return scheduler
+
+
+def get_notification_settings() -> NotificationSettings:
+    if "notification_settings" not in st.session_state:
+        st.session_state["notification_settings"] = load_notification_settings().to_dict()
+    return NotificationSettings.from_dict(st.session_state["notification_settings"])
+
+
+def update_notification_settings(settings: NotificationSettings) -> None:
+    st.session_state["notification_settings"] = settings.to_dict()
+
+
+def ensure_scheduler_job(settings: NotificationSettings) -> Tuple[bool, Optional[str], Optional[datetime]]:
+    scheduler = get_scheduler()
+
+    signature = (
+        tuple(settings.recipients),
+        tuple(settings.cc),
+        settings.subject,
+        settings.send_time,
+        settings.timezone,
+        settings.enabled,
+        settings.keywords,
+    )
+
+    previous_signature = st.session_state.get("_scheduler_signature")
+    existing_job = scheduler.get_job(SCHEDULER_JOB_ID)
+    needs_sync = (
+        previous_signature != signature
+        or (settings.enabled and existing_job is None)
+        or (not settings.enabled and existing_job is not None)
+    )
+
+    if not needs_sync:
+        next_run = existing_job.next_run_time if existing_job else None
+        return True, None, next_run
+
+    try:
+        scheduler.remove_job(SCHEDULER_JOB_ID)
+    except JobLookupError:
+        pass
+
+    if not settings.enabled:
+        st.session_state["_scheduler_signature"] = signature
+        return True, "Notifications disabled; schedule cleared.", None
+
+    try:
+        hour, minute = parse_time_string(settings.send_time)
+    except ValueError as exc:
+        return False, f"Invalid send time: {exc}", None
+
+    try:
+        timezone = ZoneInfo(settings.timezone)
+    except ZoneInfoNotFoundError:
+        return False, f"Unknown timezone: {settings.timezone}", None
+
+    try:
+        job = scheduler.add_job(
+            run_scheduled_digest,
+            trigger="cron",
+            id=SCHEDULER_JOB_ID,
+            hour=hour,
+            minute=minute,
+            timezone=timezone,
+            replace_existing=True,
+            kwargs={"settings_dict": settings.to_dict()},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Failed to schedule job: {exc}", None
+
+    st.session_state["_scheduler_signature"] = signature
+    return True, None, job.next_run_time
 
 
 @st.cache_data(show_spinner=False)
@@ -276,3 +387,112 @@ if semantic_query:
 
 data_timestamp = datetime.fromtimestamp(data_path.stat().st_mtime)
 st.caption(f"Last updated: {data_timestamp.strftime('%Y-%m-%d %H:%M:%S')} | Data source: {data_path}")
+
+
+st.divider()
+st.header("📧 Email notifications")
+
+settings = get_notification_settings()
+
+with st.form("notification-settings"):
+    st.markdown("### Daily digest settings")
+    recipients_input = st.text_area(
+        "Primary recipients",
+        value="\n".join(settings.recipients),
+        help="Use commas, semicolons, or new lines to separate addresses.",
+    )
+    cc_input = st.text_area(
+        "CC recipients",
+        value="\n".join(settings.cc),
+        help="Optional CC list.",
+    )
+    subject_input = st.text_input("Email subject", value=settings.subject)
+    keywords_input = st.text_input(
+        "Filter keywords",
+        value=settings.keywords,
+        help="Used to filter the high-priority tenders included in the digest.",
+    )
+    time_col, tz_col, enabled_col = st.columns([1, 2, 1])
+    with time_col:
+        send_time_input = st.text_input("Send time (HH:MM)", value=settings.send_time)
+    with tz_col:
+        timezone_input = st.text_input("Timezone", value=settings.timezone)
+    with enabled_col:
+        enabled_input = st.checkbox("Enable daily digest", value=settings.enabled)
+
+    submitted = st.form_submit_button("💾 Save settings")
+
+    if submitted:
+        primary_recipients = parse_recipient_input(recipients_input)
+        cc_recipients = parse_recipient_input(cc_input)
+        valid_primary, primary_errors = validate_addresses(primary_recipients)
+        valid_cc, cc_errors = validate_addresses(cc_recipients)
+
+        error_messages: List[str] = []
+        if primary_errors or cc_errors:
+            error_messages.extend(primary_errors + cc_errors)
+        if enabled_input and not valid_primary:
+            error_messages.append(
+                "At least one valid primary recipient is required when notifications are enabled."
+            )
+
+        try:
+            parse_time_string(send_time_input)
+        except ValueError as exc:
+            error_messages.append(f"Invalid send time: {exc}")
+
+        try:
+            ZoneInfo(timezone_input)
+        except ZoneInfoNotFoundError:
+            error_messages.append(f"Unknown timezone: {timezone_input}")
+
+        if error_messages:
+            st.error("\n".join(error_messages))
+        else:
+            new_settings = NotificationSettings(
+                recipients=valid_primary,
+                cc=valid_cc,
+                subject=subject_input,
+                send_time=send_time_input,
+                timezone=timezone_input,
+                enabled=enabled_input,
+                keywords=keywords_input,
+            )
+            save_notification_settings(new_settings)
+            update_notification_settings(new_settings)
+            ok, message, next_run = ensure_scheduler_job(new_settings)
+            if ok:
+                text = "Settings saved."
+                if message:
+                    text += f" {message}"
+                if next_run:
+                    text += f" Next email scheduled for {next_run.strftime('%Y-%m-%d %H:%M %Z')}."
+                st.success(text)
+            else:
+                st.error(message or "Failed to update scheduler.")
+
+
+manual_col, status_col = st.columns([1, 1])
+with manual_col:
+    if st.button("✉️ Send high-priority digest now", use_container_width=True):
+        current_settings = get_notification_settings()
+        try:
+            success, message = send_priority_digest(raw_df, current_settings)
+        except Exception as exc:  # noqa: BLE001
+            success = False
+            message = f"Manual send failed: {exc}"
+        append_notification_log(message, success)
+        if success:
+            st.success(message)
+        else:
+            st.error(message)
+
+with status_col:
+    st.markdown("#### Recent send status")
+    log_lines = tail_notification_log()
+    if log_lines:
+        st.code("\n".join(log_lines), language="text")
+    else:
+        st.info("No notification activity logged yet.")
+
+ensure_scheduler_job(settings)
