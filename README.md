@@ -57,6 +57,15 @@ Modern data pipeline and Streamlit dashboard for aggregating UAE government tend
    ARCHIVE_DATA_DIR=/absolute/path/to/data/archive
    VECTOR_DB_PATH=/absolute/path/to/data/vector_store
    AI_CACHE_PATH=/absolute/path/to/data/processed/ai_cache.json
+
+   SMTP_HOST=smtp.gmail.com          # SMTP server hostname (Gmail mail server)
+   SMTP_PORT=587                     # SMTP port (587 = secure email using TLS)
+   SMTP_USERNAME=user@gmail.com   # Email address used to authenticate with SMTP
+   SMTP_PASSWORD= 16 digit code                 # App password for the email account (NOT your Gmail login password)
+   SMTP_USE_TLS=true                 # Enables TLS encryption for secure email sending
+   SMTP_FROM_ADDRESS=youraddress@gmail.com  # "From" email address shown to recipients
+
+      
    ```
 
    All paths default to the `data/` folder in the repository if unspecified.
