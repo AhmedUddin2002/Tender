@@ -61,6 +61,9 @@ NOTIFICATION_LOG_PATH = Path(
     _get_setting("NOTIFICATION_LOG_PATH", PROCESSED_DATA_DIR / "notifications.log")
 )
 
+_playwright_path = _get_setting("PLAYWRIGHT_BROWSERS_PATH")
+PLAYWRIGHT_BROWSERS_PATH = Path(_playwright_path) if _playwright_path else None
+
 # Ensure directories exist at import time for smoother DX
 for directory in (RAW_DATA_DIR, PROCESSED_DATA_DIR, ARCHIVE_DATA_DIR):
     directory.mkdir(parents=True, exist_ok=True)

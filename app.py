@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import atexit
+import os
+import subprocess
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 from typing import List, Optional, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import streamlit as st
@@ -13,7 +15,7 @@ from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from ai_utils import get_ai_score_and_summary
-from config import LATEST_CLEAN_PATH
+from config import LATEST_CLEAN_PATH, PLAYWRIGHT_BROWSERS_PATH
 from mailer import run_scheduled_digest, send_priority_digest
 from notifications import (
     NotificationSettings,
@@ -31,6 +33,32 @@ from vectorstore import VectorResult, semantic_search
 
 FALLBACK_DATA_PATH = Path("tenders_clean.csv")
 SCHEDULER_JOB_ID = "daily_notification_digest"
+
+
+def ensure_playwright_browsers() -> None:
+    target_dir = PLAYWRIGHT_BROWSERS_PATH or Path(os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/mount/tmp/playwright"))
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(target_dir))
+
+    chromium_executable = target_dir / "chromium-1200" / "chrome-headless-shell" / "chrome-headless-shell"
+    if chromium_executable.exists():
+        return
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            ["playwright", "install", "chromium"],
+            check=True,
+            env={**os.environ, "PLAYWRIGHT_BROWSERS_PATH": str(target_dir)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as exc:  # noqa: BLE001
+        st.warning(
+            "Playwright browser installation failed; Dubai scraping may not work in this environment."
+        )
+
+
+ensure_playwright_browsers()
 
 
 st.set_page_config(page_title="UAE Tender AI Dashboard", page_icon="🇦🇪", layout="wide")
