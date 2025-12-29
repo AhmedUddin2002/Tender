@@ -4,3 +4,6 @@
 tenderenv/
 data/processed/notifications.json
 data/processed/notifications.log
+data/processed/ai_cache.json
+data/processed/tenders_clean_latest.csv
+data/raw
